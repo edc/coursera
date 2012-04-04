@@ -1,59 +1,44 @@
 #!/usr/bin/env python
 """
-For downloading lecture resources such as videos for Coursera classes. Given a class name and related cookie file, it scrapes the course listing page to get the section (week) and lecture names, and then downloads the related materials into appropriately named files and directories.
+For downloading lecture resources such as videos for Coursera classes. Given a class name and a session ID, it scrapes the course listing page to get the section (week) and lecture names, and then downloads the related materials into appropriately named files and directories.
+
+To retrieve session ID, paste the following line to address bar of the browser:
+
+    javascript:$(document.cookie.split(';')).each(function() {if(/session=/.test(this)) document.write(this.substring(9))})
 
 Examples:
-  coursera-dl -c cookies.txt saas
-  coursera-dl -c cookies.txt -l listing.html -o saas --skip-download
+  coursera-dl -s <sessionId> saas
+  coursera-dl -s <sessionId> -l listing.html -o saas --skip-download
 
-Author: 
+Author:
   John Lehmann (first last at geemail dotcom or @jplehmann)
+Modified by:
+  Eddie Cao
 """
 
 import sys, os, re, string
-import urllib2, cookielib 
-import tempfile
 import subprocess
 import argparse
-import StringIO
 from BeautifulSoup import BeautifulSoup        
+import requests
+import urllib2
+from contextlib import closing
 
 def get_syllabus_url(className):
   """Return the Coursera index/syllabus URL."""
   return "http://class.coursera.org/%s/lecture/index" % className
 
-def load_cookies_file(cookies_file):
-  """Loads the cookies file. I am pre-pending the file with the special
-  Netscape header because the cookie loader is being very particular about 
-  this string."""
-  cookies = StringIO.StringIO()
-  NETSCAPE_HEADER = "# Netscape HTTP Cookie File"
-  cookies.write(NETSCAPE_HEADER);
-  cookies.write(open(cookies_file, 'r').read())
-  cookies.flush()
-  cookies.seek(0)
-  return cookies
-
-def get_opener(cookies_file):
-  """Use cookie file to create a url opener."""
-  cj = cookielib.MozillaCookieJar()
-  cookies = load_cookies_file(cookies_file)
-  # nasty hack: cj.load() requires a filename not a file, but if
-  # I use stringio, that file doesn't exist. I used NamedTemporaryFile 
-  # before, but encountered problems on Windows.
-  cj._really_load(cookies, "StringIO.cookies", False, False)
-  return urllib2.build_opener(urllib2.HTTPCookieProcessor(cj))
-
-def get_page(url, cookies_file):
+def get_page(url, session_id):
   """Download an HTML page using the cookiejar."""
-  opener = get_opener(cookies_file)
-  return opener.open(url).read()
+  r = requests.get('http://class.coursera.org/crypto/lecture/index',
+          cookies=dict(session=session_id))
+  return r.content
 
-def get_syllabus(class_name, cookies_file, local_page=False):
+def get_syllabus(class_name, session_id, local_page=False):
   """ Get the course listing webpage."""
   if (not (local_page and os.path.exists(local_page))):
     url = get_syllabus_url(class_name)
-    page = get_page(url, cookies_file)
+    page = get_page(url, session_id)
     print "Downloaded %s (%d bytes)" % (url, len(page))
     # cache the page if we're in 'local' mode
     if (local_page):
@@ -109,7 +94,7 @@ def parse_syllabus(page):
 
 def download_lectures(
   wget_bin, 
-  cookies_file, 
+  session_id, 
   class_name, 
   sections, 
   file_formats, 
@@ -142,45 +127,46 @@ def download_lectures(
         print lecfn
         if overwrite or not os.path.exists(lecfn):
           if not skip_download: 
-            download_file(url, lecfn, cookies_file, wget_bin)
+            download_file(url, lecfn, wget_bin)
           else: 
             open(lecfn, 'w').close()  # touch
 
-def download_file(url, fn, cookies_file, wget_bin):
+def download_file(url, fn, wget_bin):
   """Downloads file and removes current file if aborted by user."""
   try:
     if wget_bin:
-      download_file_wget(wget_bin, url, fn, cookies_file)
+      download_file_wget(wget_bin, url, fn)
     else:
-      download_file_nowget(url, fn, cookies_file)
+      download_file_nowget(url, fn)
   except KeyboardInterrupt, e: 
     print "\nKeyboard Interrupt -- Removing partial file:", fn
     os.remove(fn)
     sys.exit()
 
-def download_file_wget(wget_bin, url, fn, cookies_file):
+def download_file_wget(wget_bin, url, fn):
   """Downloads a file using wget.  Could possibly use python to stream files to
   disk, but wget is robust and gives nice visual feedback."""
-  cmd = [wget_bin, url, "-O", fn, "--load-cookies", cookies_file, "--no-check-certificate"]
+  cmd = [wget_bin, url, "-O", fn, "--no-check-certificate"]
   print "Executing wget:", cmd 
   retcode = subprocess.call(cmd)
 
-def download_file_nowget(url, fn, cookies_file):
+def download_file_nowget(url, fn):
   """'Native' python downloader -- slower than wget."""
   print "Downloading %s -> %s" % (url, fn)
-  urlfile = get_opener(cookies_file).open(url)
-  chunk_sz = 1048576
-  bytesread = 0
-  f = open(fn, "wb")
-  while True:
-    data = urlfile.read(chunk_sz)
-    if not data:
-      print "."
-      break
-    f.write(data)
-    bytesread += len(data)
-    print "\r%d bytes read" % bytesread,
-    sys.stdout.flush()
+  request = urllib2.Request(url)
+  with closing(urllib2.urlopen(request)) as urlfile:
+    chunk_sz = 1048576
+    bytesread = 0
+    f = open(fn, "wb")
+    while True:
+      data = urlfile.read(chunk_sz)
+      if not data:
+        print "."
+        break
+      f.write(data)
+      bytesread += len(data)
+      print "\r%d bytes read" % bytesread,
+      sys.stdout.flush()
 
 def parseArgs():
   parser = argparse.ArgumentParser(description='Download Coursera.org lecture material and resources.')
@@ -188,8 +174,8 @@ def parseArgs():
   parser.add_argument('class_name', action='store', 
     help='name of the class (e.g. "nlp")')
   # required
-  parser.add_argument('-c', '--cookies_file', dest='cookies_file', 
-    action='store', required=True, help='full path to the cookies.txt file')
+  parser.add_argument('-s', '--session', dest='session_id', 
+    action='store', required=True, help='session ID')
   # optional
   parser.add_argument('-f', '--formats', dest='file_formats', 
     action='store', default="all", help='file format extensions to be downloaded in quotes space separated, e.g. "mp4 pdf" (default: special value "all")')
@@ -210,18 +196,15 @@ def parseArgs():
   args = parser.parse_args()
   # turn list of strings into list
   args.file_formats = args.file_formats.split()
-  # check arguments
-  if not os.path.exists(args.cookies_file):
-    raise IOError("Cookies file not found: " + args.cookies_file)
   return args
 
 def main():
   args = parseArgs()
-  page = get_syllabus(args.class_name, args.cookies_file, args.local_page)
+  page = get_syllabus(args.class_name, args.session_id, args.local_page)
   sections = parse_syllabus(page)
   download_lectures(
     args.wget_bin, 
-    args.cookies_file, 
+    args.session_id,
     args.class_name, 
     sections, 
     args.file_formats, 
